@@ -1,5 +1,8 @@
-agx-robot-bridge
-Copyright AgenticX contributors. Licensed under the Apache License, Version 2.0.
+lerobot-policy-bridge (Python package: agx-robot-bridge)
+Copyright 2026 Hongyi Zhao. Licensed under the Apache License, Version 2.0.
+
+This code was also contributed under the same license to AgenticX
+(https://github.com/DemonDamon/AgenticX), pull request #62.
 
 Optional runtime dependency (installed via the `lerobot` extra, not vendored):
 

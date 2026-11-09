@@ -1,72 +1,92 @@
-# agx-robot-bridge
+# lerobot-policy-bridge
 
-本机机器人策略桥接服务：在独立 Python 3.12 环境里托管一个策略 rollout 会话（加载策略、连接机器人、运行 / 改任务 / 复位 / 停止、相机快照），通过仅监听本机的 HTTP 接口供 AgenticX 调用。实时控制环完全在本进程内运行，AgenticX 只下发任务级指令，从不下发关节动作。
+A localhost HTTP service that hosts one [LeRobot](https://github.com/huggingface/lerobot) policy rollout session and exposes it through task-level commands: load a policy, connect a robot, start / change task / reset / stop, and take camera snapshots. An LLM agent can direct the robot through this API without ever sending joint actions; the real-time control loop runs entirely inside the bridge process.
 
-- `--backend fake`：纯 Python 模拟后端，不需要 torch 和硬件，用于测试与联调。
-- `--backend lerobot`：真实后端，包装 LeRobot 的 `RolloutController`（需安装 `lerobot` extra）。
+It ships with a simulated SO-101 follower arm, so the whole chain runs end to end with a real pretrained policy and no hardware.
 
-## 安装
+This is the robot-side half of the LeRobot integration for [AgenticX](https://github.com/DemonDamon/AgenticX), submitted upstream in [AgenticX PR #62](https://github.com/DemonDamon/AgenticX/pull/62). The agent-side half (robot tools, non-waivable `risk=robot` confirmations, Meta-Agent prompt) lives in that PR. This repository holds the bridge on its own, with its commit history. The Python package is named `agx-robot-bridge` and its default paths live under `~/.agenticx/`, matching the upstream integration; the bridge itself does not import or depend on AgenticX.
 
-```bash
-uv venv --python 3.12 ~/.agenticx/robot-bridge-venv
-source ~/.agenticx/robot-bridge-venv/bin/activate
-uv pip install -e 'packaging/robot-bridge[test]'            # 仅 fake 后端
-uv pip install -e 'packaging/robot-bridge[lerobot,test]'    # 真实机器人
+```
+LLM agent ──task-level HTTP──▶ agx-robot-bridge ──▶ LeRobot RolloutController ──▶ robot
+           (localhost only,     (session state machine,  (real-time control loop,     (SO-101 or the
+            bearer token)        safety checks)            in-process)                  simulated arm)
 ```
 
-bridge 不依赖 AgenticX 主包，AgenticX 主环境也不需要安装 lerobot / torch。
+## Design
 
-`lerobot` extra 固定到上游一个 git 修订（见 `pyproject.toml`）：`RolloutController` 尚未进入任何已发布版本。`serve --backend lerobot` 启动时会检查该接口，缺失则打印原因并以退出码 2 退出。
+The agent should direct a robot at the task level while the real-time control loop stays in a separate process. The bridge is that process boundary:
 
-### 模拟机器人（无硬件联调）
+- **Local only, authenticated.** Every route, including `/health`, requires a bearer token read from a 0600 token file. The server binds to loopback only, and the unauthenticated API docs are off.
+- **One session, bounded motion.** Only one hardware-owning session exists at a time, and creating a session requires a per-step motion limit (`robot.max_relative_target`). `robot.extra` cannot override the robot type, port, id, cameras or motion limit, and keys that could inject extra rollout arguments are rejected.
+- **Fail closed on calibration.** Before loading, the arm is connected once without calibration; an uncalibrated arm fails as `calibration_required`, with the exact `lerobot-calibrate` command as the hint. Any interactive input request inside the process fails fast instead of blocking or swallowing the agent's commands.
+- **Stop always releases the robot.** Stop works from every state, is idempotent and waits for an in-flight load. It halts the control loop, returns the arm home, reads the joint pose back and reports whether it is within tolerance, then disconnects the hardware. SIGTERM stops the active session before the process exits.
+- **Works offline.** The vision backbone's ImageNet init download is skipped by default; trained weights still come from the checkpoint.
 
-`sim/lerobot_robot_agx_sim` 是一个模拟 SO-101 从臂插件（机器人类型 `agx_sim_so101`），关节与相机特征（6 个 `<joint>.pos`，`front` / `handeye` 480×640）与 SO-101 的 ACT 策略一致，可直接跑真实策略：
+These constraints come from a no-hardware proof of concept that drove `lerobot-rollout --interactive` directly through an agent's generic shell tools; see [docs/poc.md](docs/poc.md).
+
+## Install
 
 ```bash
-uv pip install -e packaging/robot-bridge/sim/lerobot_robot_agx_sim   # 装进已含 lerobot extra 的同一环境
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install -e '.[test]'            # fake backend only
+uv pip install -e '.[lerobot,test]'    # real robot
 ```
 
-插件本身不声明 lerobot 依赖，避免覆盖上面固定的修订。`robot.extra` 可传 `{"calibrated": false}` 模拟未标定机器人、`{"camera_names": [...]}` 改相机集合。
+- `--backend fake`: a pure-Python simulated backend that needs neither torch nor hardware, for tests and integration work.
+- `--backend lerobot`: the real backend, wrapping LeRobot's `RolloutController` (requires the `lerobot` extra).
 
-## 运行
+The `lerobot` extra is pinned to an upstream git revision (see `pyproject.toml`) because `RolloutController` is not in any published release yet. `serve --backend lerobot` checks for that API at startup; if it is missing, it prints the reason and exits with code 2.
+
+### Simulated robot (no hardware)
+
+`sim/lerobot_robot_agx_sim` is a simulated SO-101 follower plugin (robot type `agx_sim_so101`). Its joint and camera features (six `<joint>.pos`, `front` / `handeye` at 480×640) match SO-101 ACT policies, so it can run a real policy directly:
 
 ```bash
-agx-robot-bridge serve --backend fake          # 默认 127.0.0.1:8766
+uv pip install -e sim/lerobot_robot_agx_sim   # into the same environment that has the lerobot extra
+```
+
+The plugin does not declare a lerobot dependency, so it never replaces the pinned revision above. Pass `{"calibrated": false}` in `robot.extra` to simulate an uncalibrated robot, or `{"camera_names": [...]}` to change the camera set.
+
+## Run
+
+```bash
+agx-robot-bridge serve --backend fake          # default 127.0.0.1:8766
 agx-robot-bridge serve --backend lerobot --port 8766
 ```
 
-| 参数 | 默认值 | 说明 |
+| Option | Default | Notes |
 |---|---|---|
-| `--host` | `127.0.0.1` | 只接受 `127.0.0.1` / `localhost` / `::1`，其他地址直接退出（退出码 2） |
+| `--host` | `127.0.0.1` | Only `127.0.0.1` / `localhost` / `::1` are accepted; anything else exits with code 2 |
 | `--port` | `8766` | |
-| `--backend` | `lerobot` | `lerobot` 或 `fake` |
-| `--token-file` | `~/.agenticx/robot_bridge.token` | 不存在或为空时自动生成，权限 0600 |
-| `--snapshot-dir` | `~/.agenticx/robot/snapshots` | 快照 PNG 落盘目录 |
+| `--backend` | `lerobot` | `lerobot` or `fake` |
+| `--token-file` | `~/.agenticx/robot_bridge.token` | Generated with mode 0600 if missing or empty |
+| `--snapshot-dir` | `~/.agenticx/robot/snapshots` | Where snapshot PNGs are written |
 
-日志同时写 stderr 与 `~/.agenticx/logs/robot_bridge/bridge.log`（含访问日志，不含 token）。
+Logs go to stderr and to `~/.agenticx/logs/robot_bridge/bridge.log` (including access logs, never the token).
 
-进程启动时会把 `input()` 替换为立即报错、并把 stdin 指向 `/dev/null`：任何库代码请求交互输入（典型是未标定机器人的标定提示）都会让会话以 `stdin_input_blocked` 失败，而不是卡住或吞掉输入。标定必须事先在终端用 `lerobot-calibrate` 完成。
+At startup the process replaces `input()` with a function that raises immediately and points stdin at `/dev/null`. Any library code that asks for interactive input (typically the calibration prompt of an uncalibrated robot) makes the session fail with `stdin_input_blocked` instead of hanging or consuming input. Calibrate beforehand in a terminal with `lerobot-calibrate`.
 
-收到 SIGTERM / Ctrl+C 时，bridge 会先停止当前会话（停推理、回位、校验位姿、断开硬件）再退出；托管该进程时 kill 宽限应 ≥ 15 秒。
+On SIGTERM or Ctrl+C the bridge first stops the current session (stop inference, return home, verify the pose, disconnect the hardware) and then exits. A supervisor should allow a kill grace period of at least 15 seconds.
 
-## HTTP 接口
+## HTTP API
 
-所有接口（含 `/health`）都要求 `Authorization: Bearer <token>`。错误统一返回 `{"ok": false, "error_code", "error", "hint"}`。同一时间只允许一个占用硬件的会话。
+Every endpoint, including `/health`, requires `Authorization: Bearer <token>`. Errors always have the shape `{"ok": false, "error_code", "error", "hint"}`. Only one hardware-owning session is allowed at a time.
 
-| Method | Path | 说明 |
+| Method | Path | Description |
 |---|---|---|
-| GET | `/health` | 版本、后端名、Python 与 lerobot 版本 |
-| POST | `/session` | 创建会话并后台加载，返回 202 与 `session_id`；`robot.max_relative_target` 必填，见下文 |
-| GET | `/session/{sid}?since=<seq>` | 状态、事件（`seq > since`）、`pose_check`、错误信息 |
-| POST | `/session/{sid}/start` | 开始一段运行（仅 `idle`） |
-| POST | `/session/{sid}/task` | `{"task": "..."}`，改任务，下一次推理生效 |
-| POST | `/session/{sid}/reset` | 停止当前动作、回到初始位姿、恢复初始任务；约 0.5 秒后给出回位校验 |
-| POST | `/session/{sid}/stop` | 任何状态可调、幂等；加载中调用返回 202 `stopping` |
-| GET | `/session/{sid}/snapshot?camera=<name>` | PNG（宽度 ≤ 640）的 base64 与落盘路径 |
+| GET | `/health` | Version, backend name, Python and lerobot versions |
+| POST | `/session` | Create a session and load it in the background; returns 202 with `session_id`. `robot.max_relative_target` is required, see below |
+| GET | `/session/{sid}?since=<seq>` | State, events with `seq > since`, `pose_check`, error details |
+| POST | `/session/{sid}/start` | Start a run (only from `idle`) |
+| POST | `/session/{sid}/task` | `{"task": "..."}`: change the task; takes effect at the next inference |
+| POST | `/session/{sid}/reset` | Stop the current motion, return to the initial pose and restore the initial task; the return-to-home check follows after about 0.5 s |
+| POST | `/session/{sid}/stop` | Callable from any state, idempotent; returns 202 `stopping` while loading |
+| GET | `/session/{sid}/snapshot?camera=<name>` | Base64 PNG (width ≤ 640) and the path it was written to |
 
-会话状态：`loading` → `idle` ⇄ `running` / `resetting`，失败为 `failed`，停止过程为 `stopping` → `stopped`。
+Session states: `loading` → `idle` ⇄ `running` / `resetting`; failures end in `failed`; stopping goes `stopping` → `stopped`.
 
-### 创建会话（`POST /session`）
+### Creating a session (`POST /session`)
 
 ```json
 {
@@ -78,24 +98,29 @@ agx-robot-bridge serve --backend lerobot --port 8766
 }
 ```
 
-- `robot.extra` 透传其余机器人配置项（如 `{"use_degrees": true}`），值为对象 / 数组时按 JSON 传入；不能用它覆盖 `type` / `port` / `id` / `cameras` / `max_relative_target`。
-- `offline_backbone`（默认 `true`）：跳过视觉骨干的 ImageNet 初始化权重下载，训练好的权重仍从 checkpoint 加载，离线环境可用。
-- 加载前会先以不标定方式连一次机器人：未标定直接失败为 `calibration_required`，`hint` 给出对应的 `lerobot-calibrate` 命令；加载过程中任何一步失败都会断开已连接的机器人。
-- `stop` 与 `reset` 之后的回位都会读回关节位姿并与初始位姿比较（`pose_check`），误差超过 `home_tolerance`（单位与关节读数一致）即 `verified: false`。
-- CPU 推理时控制环常低于目标 fps，日志里的 "Control loop is running slower" 告警属预期。
+- `robot.extra` passes through other robot config options (for example `{"use_degrees": true}`); object and array values are passed as JSON. It cannot override `type` / `port` / `id` / `cameras` / `max_relative_target`.
+- `offline_backbone` (default `true`) skips the ImageNet init download of the vision backbone. Trained weights still load from the checkpoint, so this works offline.
+- Before loading, the robot is connected once without calibration. An uncalibrated robot fails immediately as `calibration_required`, and `hint` gives the matching `lerobot-calibrate` command. If any load step fails, the robot is disconnected if it was already connected.
+- After `stop` and `reset`, the return to home reads the joint pose back and compares it with the initial pose (`pose_check`). An error above `home_tolerance` (same units as the joint readings) gives `verified: false`.
+- With CPU inference the control loop often runs below the target fps; the "Control loop is running slower" warning in the log is expected.
 
-## 测试
+## Tests
 
 ```bash
-cd packaging/robot-bridge
 python -m pytest tests -q
 ```
 
-包内自带 pytest 配置，不会读取仓库根目录的配置。未安装 lerobot 时真实后端用例自动跳过，其余测试不需要 torch 或硬件。
+The package carries its own pytest config. Without lerobot installed, the real-backend tests are skipped and the rest need neither torch nor hardware: 45 passed, 5 skipped.
 
-真实后端集成用例（真实策略 + 模拟机器人，需要 `lerobot` extra 与模拟插件）：
+Real-backend integration tests (a real policy on the simulated robot; needs the `lerobot` extra and the simulated arm plugin):
 
 ```bash
 AGX_ROBOT_BRIDGE_POLICY_PATH=/path/to/act_so101_checkpoint AGX_ROBOT_BRIDGE_DEVICE=cpu \
   python -m pytest tests/test_lerobot_backend_sim.py -v
 ```
+
+With the ACT checkpoint [`kai-yamada/act_so101_pick_cube`](https://huggingface.co/kai-yamada/act_so101_pick_cube) on CPU, the full suite gives 50 passed. ACT does not read the language instruction, so these runs exercise the `/task` command path, not a change in policy behavior; that needs a language-conditioned VLA policy.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). LeRobot is an optional runtime dependency and is not vendored.
